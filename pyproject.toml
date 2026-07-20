@@ -184,7 +184,14 @@ mem0 = ["mem0ai==2.0.10"]
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
 # (see the main `dependencies` list above) since the byte/pixel shrink paths are on
 # the default vision-embed path and the mid-session lazy install deadlocked the
-# CLI under prompt_toolkit (#40490).
+# CLI under prompt_toolkit (#40490). This extra is kept as a no-op back-compat
+# alias so existing `pip install hermes-agent[vision]` invocations resolve.
+vision = []
+# Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
+# in the main `dependencies` list (with the same platform markers), so
+# any existing `pip install hermes-agent[pty]` invocations resolve cleanly
+# without pulling in extra packages.
+pty = []
 # CVE-2026-48710 (BadHost): Starlette is pulled transitively by mcp's
 # sse-starlette / HTTP-SSE stack (and by fastapi in the `web` extra). Before
 # 1.0.1, a malformed Host header makes `request.url.path` desync from the path
@@ -234,6 +241,7 @@ termux-all = [
   "hermes-agent[homeassistant]",
   "hermes-agent[sms]",
   "hermes-agent[web]",
+  "hermes-agent[pty]",
 ]
 dingtalk = ["dingtalk-stream==0.24.3", "alibabacloud-dingtalk==2.2.42", "qrcode==7.4.2"]
 feishu = ["lark-oapi==1.6.8", "qrcode==7.4.2"]
@@ -281,6 +289,7 @@ all = [
   # where the user is expected to have a toolchain available.
   "hermes-agent[cron]",
   "hermes-agent[cli]",
+  "hermes-agent[pty]",
   "hermes-agent[mcp]",
   "hermes-agent[homeassistant]",
   "hermes-agent[sms]",
@@ -294,6 +303,11 @@ all = [
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+
+[tool.setuptools]
+# Top-level single-file modules (not packages). Without this, uv2nix's
+# sealed venv is missing hermes_constants, run_agent, etc.
+py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]

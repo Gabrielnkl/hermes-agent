@@ -17,7 +17,6 @@ ACP 适配器将 Hermes 的同步 `AIAgent` 封装为异步 JSON-RPC stdio 服�
 - `acp_adapter/permissions.py`
 - `acp_adapter/tools.py`
 - `acp_adapter/auth.py`
-- `acp_registry/agent.json`
 
 ## 启动流程
 
@@ -30,8 +29,6 @@ hermes acp / hermes-acp / python -m acp_adapter
   -> construct HermesACPAgent
   -> acp.run_agent(agent, use_unstable_protocol=True)
 ```
-
-Zed ACP Registry 路径通过 `uvx --from 'hermes-agent[acp]==<version>' hermes-acp` 启动同一适配器，指向 `hermes-agent` PyPI 发布包。
 
 stdout 保留用于 ACP JSON-RPC 传输。人类可读的日志输出至 stderr。
 
