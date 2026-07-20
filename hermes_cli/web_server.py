@@ -3876,7 +3876,7 @@ async def check_hermes_update(force: bool = False):
         "current_version": __version__,
         "behind": None,
         "update_available": False,
-        "can_apply": install_method in ("git", "pip"),
+        "can_apply": install_method == "git",
         "update_command": update_command,
         "message": None,
     }
@@ -3910,9 +3910,9 @@ async def check_hermes_update(force: bool = False):
     else:
         payload["update_available"] = True
         # Enrich with the actual commits we're behind by, so the desktop's
-        # remote update overlay can show "what's changed". git/pip only;
+        # remote update overlay can show "what's changed". git only;
         # best-effort (empty list on any failure).
-        if install_method in ("git", "pip"):
+        if install_method == "git":
             payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
 
     return payload
