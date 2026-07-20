@@ -161,3 +161,14 @@ def test_container_unknown_install_without_stamp_is_unknown(tmp_path):
 def test_recommended_update_command_docker():
     from hermes_cli.config import recommended_update_command_for_method
     assert "docker pull" in recommended_update_command_for_method("docker")
+
+
+def test_nix_store_path_detected_as_nixos(tmp_path):
+    """A code path under /nix/store/ (nix run / nix profile install) is detected
+    as 'nixos' even without HERMES_MANAGED or a .install_method stamp."""
+    fake_nix = tmp_path / "nix" / "store" / "abc123-hermes-agent-0.19.0"
+    fake_nix.mkdir(parents=True)
+    with patch("hermes_cli.config.get_managed_system", return_value=None), \
+         patch("hermes_cli.config.get_hermes_home", return_value=tmp_path):
+        from hermes_cli.config import detect_install_method
+        assert detect_install_method(project_root=fake_nix) == "nixos"
