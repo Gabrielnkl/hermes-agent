@@ -290,6 +290,11 @@ all = [
   "hermes-agent[youtube]",
 ]
 
+[project.scripts]
+hermes = "hermes_cli.main:main"
+hermes-agent = "run_agent:main"
+hermes-acp = "acp_adapter.entry:main"
+
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
 
