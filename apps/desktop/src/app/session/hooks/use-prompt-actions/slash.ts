@@ -7,6 +7,7 @@ import { parseCommandDispatch, parseSlashCommand, sessionTitle } from '@/lib/cha
 import {
   type CommandsCatalogLike,
   type DesktopActionId,
+  type DesktopCommandSurface,
   type DesktopPickerId,
   desktopSlashUnavailableMessage,
   isDesktopSlashCommand,
@@ -32,7 +33,7 @@ import {
 
 import type { BrowserManageResponse, ClientSessionState, SessionCompressResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
 
-import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, slashStatusText, type SubmitTextOptions } from './utils'
+import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, renderRpcResult, slashStatusText, type SubmitTextOptions } from './utils'
 
 // Manual compression is LLM-bound and routinely outlives the desktop's 30s
 // default WS request timeout on large sessions — give it the TUI client's
@@ -94,6 +95,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
     submitPromptText,
     updateSessionState
   } = deps
+
   const compressInFlightRef = useRef(new Set<string>())
 
   return useCallback(
@@ -261,6 +263,44 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
       }
 
+      // `rpc` commands have a dedicated gateway handler — skip slash.exec /
+      // command.dispatch entirely. The response is structured (a JSON RPC
+      // reply, not an inline text stream) so we render it via the generic
+      // `renderRpcResult` shaper that knows the field conventions shared by
+      // session.save / session.status / session.usage / session.steer /
+      // process.stop / agents.list.
+      async function runRpc(
+        surface: Extract<DesktopCommandSurface, { kind: 'rpc' }>,
+        ctx: SlashActionCtx
+      ): Promise<void> {
+        const resolved = await withSlashOutput(ctx)
+
+        if (!resolved) {
+          return
+        }
+
+        const { render: renderSlashOutput, sessionId } = resolved
+
+        try {
+          const params = surface.buildParams({
+            arg: ctx.arg,
+            command: ctx.command,
+            name: ctx.name,
+            sessionId
+          })
+
+          // Forward the surface's declared timeout when present; the default
+          // requestGateway layer keeps (30s) is too tight for RPCs that do
+          // real work.
+          const result = await requestGateway<unknown>(surface.rpc, params, surface.timeoutMs)
+          const body = renderRpcResult(result, ctx.name)
+
+          renderSlashOutput(body || `/${ctx.name}: no output`)
+        } catch (err) {
+          renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
       // One handler per `action` command. Adding a desktop-native command is a
       // registry row in desktop-slash-commands.ts plus an entry here — never a
       // new branch in a dispatch ladder.
@@ -346,6 +386,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               const lines = [result.summary.headline, result.summary.token_line, result.summary.note].filter(
                 (line): line is string => Boolean(line)
               )
+
               notify({ durationMs: 5_000, id: noticeId, kind: 'success', message: lines.join('\n') })
 
               return
@@ -729,6 +770,9 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           case 'action':
             return actionHandlers[surface.action](ctx)
+
+          case 'rpc':
+            return runRpc(surface, ctx)
 
           default:
             // exec spec, or an unknown skill / quick command the backend owns.
