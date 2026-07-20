@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=77.0,<83"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-agent"
 version = "0.19.0"
@@ -285,6 +289,9 @@ all = [
   "hermes-agent[web]",
   "hermes-agent[youtube]",
 ]
+
+[tool.setuptools.packages.find]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

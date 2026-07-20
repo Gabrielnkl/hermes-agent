@@ -1517,7 +1517,7 @@ wheels = [
 [[package]]
 name = "hermes-agent"
 version = "0.19.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "certifi" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'" },
