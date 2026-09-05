@@ -1406,6 +1406,17 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    # Delegation inheritance: a tainted parent turn must not
+    # launder provenance through a fresh child session. Inherit the parent's
+    # active taint into the child's initial turn (one-shot consume at the
+    # child's turn start). Findings come from the ambient parent taint
+    # record — model-controlled delegation arguments (goal, role, session
+    # refs) cannot influence this. Fail-closed: a staging failure on a
+    # known-tainted parent raises here, failing this delegation tool call
+    # with an error rather than starting a silent clean child. Clean
+    # parents return False and delegation proceeds unchanged.
+    from tools.approval import inherit_parent_taint_to_child
+    inherit_parent_taint_to_child(getattr(child, "session_id", "") or "")
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the

@@ -823,6 +823,136 @@ DANGEROUS_PATTERNS_COMPILED = [
 ]
 
 
+# =========================================================================
+# Sensitive reads (confidentiality companion to write gating)
+# =========================================================================
+#
+# Write-side gating (redirection/tee/cp/sed -i into credential paths) stops
+# persistence and destruction, but the terminal runs as the invoking UID so
+# READS of the same stores (``cat ~/.hermes/.env``, ``cat ~/.ssh/id_rsa``,
+# bare ``env``) auto-approved with zero authorization — the exact primitive
+# a prompt-injected ``cat`` needs. This rule set is DISTINCT from
+# provenance taint: it fires on the command shape alone, tainted or not,
+# and routes into the normal approval gate (prompt with a human, deny
+# without one) rather than blocking unconditionally.
+_SSH_KEY_BASENAMES = r'(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys)\b'
+_KEY_FILE_EXTENSIONS = r'[\w\-]+\.(?:pem|key|p12|pfx|asc|gpg)\b'
+_HERMES_AUTH_STORES = (
+    r'(?:~/\.hermes/|'
+    r'(?:\$home|\$\{home\})/\.hermes/|'
+    r'(?:\$hermes_home|\$\{hermes_home\})/)'
+    r'(?:auth\.json|webhook_subscriptions\.json|anthropic_oauth\.json|'
+    r'auth/google_oauth\.json|mcp-tokens/)'
+)
+_CLOUD_CRED_DIRS = (
+    r'(?:~|\$home|\$\{home\})/\.'
+    r'(?:aws|kube|gnupg|docker|azure|config/gh|config/gcloud)/\S*'
+)
+# Credential *directories* themselves (not just specific files
+# inside them). Without this, ``tar -cf - ~/.hermes`` or ``cp -r ~/.aws``
+# slip through the sensitive-read detector because no specific filename
+# appears in the command, even though the entire credential store is
+# read/archived. The trailing ``(?:/\S*)?`` greedily consumes any descendant
+# path (``~/.hermes/foo``, ``~/.hermes/subdir/file``) so anything under the
+# credential directory is treated as sensitive; the outer
+# ``_READ_TARGET_BOUNDARY`` handles whitespace/separator/EOS termination.
+# Sibling names like ``~/.hermes2`` are rejected because the boundary
+# check fails on the trailing non-boundary character.
+_SENSITIVE_CRED_DIRS = (
+    r'(?:~|\$home|\$\{home\})/\.'
+    r'(?:hermes|ssh|aws|kube|gnupg|docker|azure)'
+    r'(?:/\S*)?'
+)
+# Same directories under macOS/Linux absolute-path forms. Only
+# matches the cloud-credential set — ``~/.ssh`` and ``~/.hermes`` already
+# have other identifiers (key basenames / Hermes config patterns) that
+# would catch the read; the cloud creds rely entirely on directory shape.
+# Restricting to /(home|Users|root)/<name>/<cred>/ avoids making every
+# absolute path sensitive. The trailing ``\S*`` greedily consumes the
+# file/component portion (mirrors _CLOUD_CRED_DIRS for the home-prefix form).
+_SENSITIVE_CRED_DIRS_ABS = (
+    r'/(?:home|Users|root)(?:/[^/\s]+)?/\.'
+    r'(?:aws|kube|gnupg|docker|azure)'
+    r'(?:/\S*|(?=$))'
+)
+_SENSITIVE_READ_TARGET = (
+    rf'(?:{_SSH_SENSITIVE_PATH}|'
+    rf'{_HERMES_ENV_PATH}|'
+    rf'{_HERMES_CONFIG_PATH}|'
+    rf'{_HERMES_AUTH_STORES}|'
+    rf'{_SHELL_RC_FILES}|'
+    rf'{_CREDENTIAL_FILES}|'
+    rf'{_CLOUD_CRED_DIRS}|'
+    rf'{_PROJECT_SENSITIVE_WRITE_TARGET}|'
+    rf'{_SSH_KEY_BASENAMES}|'
+    rf'{_KEY_FILE_EXTENSIONS}|'
+    rf'{_SENSITIVE_CRED_DIRS}|'
+    rf'{_SENSITIVE_CRED_DIRS_ABS})'
+)
+# Verbs whose execution prints (parts of) the target file to stdout.
+# ``dd if=~/.hermes/.env`` is a canonical exfil primitive;
+# ``dd`` reads a file and writes it (to stdout, another file, or a pipe),
+# so it must trigger the same sensitive-read handling as ``cat``/``head``.
+_SENSITIVE_READ_VERBS = (
+    r'(?:cat|tac|head|tail|less|more|most|bat|nl|strings|xxd|od|hexdump|'
+    r'grep|egrep|fgrep|rg|ag|ack|sed|awk|gawk|mawk|jq|yq|base64|cut|sort|uniq|wc|'
+    r'dd)'
+)
+_READ_TARGET_BOUNDARY = r'(?=[\s;&|"\'\n]|$)'
+SENSITIVE_READ_PATTERNS = [
+    (
+        rf'{_CMDPOS}{_SENSITIVE_READ_VERBS}\b[^\n]*?(?:{_SENSITIVE_READ_TARGET}){_READ_TARGET_BOUNDARY}',
+        "sensitive-read:credential-file",
+        "read of sensitive credential/SSH/Hermes file",
+    ),
+    (
+        rf'{_CMDPOS}(?:tar|zip|7z)\b[^\n]*?(?:{_SENSITIVE_READ_TARGET}){_READ_TARGET_BOUNDARY}',
+        "sensitive-read:archive-include",
+        "archive including sensitive credential/SSH/Hermes files",
+    ),
+    (
+        rf'{_CMDPOS}(?:cp|scp|rsync)\b[^\n]*?(?:{_SENSITIVE_READ_TARGET}){_READ_TARGET_BOUNDARY}',
+        "sensitive-read:copy-touch",
+        "copy/transfer touching sensitive credential/SSH/Hermes files",
+    ),
+    (
+        rf'{_CMDPOS}env\b((?:\s+[A-Za-z_]\w*=\S*)*)\s*(?:[|;&\n]|$)',
+        "sensitive-read:env-enumeration",
+        "environment enumeration (dumps secrets into context)",
+    ),
+    (
+        rf'{_CMDPOS}printenv\s*(?:[|;&\n]|$)',
+        "sensitive-read:env-enumeration",
+        "environment enumeration (dumps secrets into context)",
+    ),
+    (
+        rf'{_CMDPOS}set\s*(?:[|;&\n]|$)',
+        "sensitive-read:env-enumeration",
+        "environment enumeration (dumps secrets into context)",
+    ),
+]
+SENSITIVE_READ_PATTERNS_COMPILED = [
+    (re.compile(pattern, _RE_FLAGS), key, description)
+    for pattern, key, description in SENSITIVE_READ_PATTERNS
+]
+
+
+def _detect_sensitive_read(command: str) -> tuple:
+    """Check if a command reads sensitive credential stores or enumerates env.
+
+    Returns (True, pattern_key, description) or (False, None, None).
+    Detection-only: the caller decides approval vs. block. Uses the same
+    detection variants (home-prefix folding, quote-aware command starts) as
+    dangerous-command detection so ``$HOME/.hermes/.env`` and friends match.
+    """
+    for command_variant in _command_detection_variants(command):
+        command_lower = command_variant.lower()
+        for pattern_re, pattern_key, description in SENSITIVE_READ_PATTERNS_COMPILED:
+            if pattern_re.search(command_lower):
+                return (True, pattern_key, description)
+    return (False, None, None)
+
+
 def _legacy_pattern_key(pattern: str) -> str:
     """Reproduce the old regex-derived approval key for backwards compatibility."""
     return pattern.split(r'\b')[1] if r'\b' in pattern else pattern[:20]
@@ -2019,6 +2149,444 @@ _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
 # =========================================================================
+# Per-turn provenance taint (defense-in-depth)
+# =========================================================================
+#
+# When a tool result carries high-confidence prompt-injection findings,
+# the turn is marked tainted. Terminal / execute_code guards consult this
+# mark and route capability-bearing actions to human authorization instead
+# of auto-approving them.
+#
+# Identity: keys are ``(session_key, turn_id)``. The session key comes from
+# the same resolution as every other approval decision
+# (``get_current_session_key()`` — gateway/TUI/CLI bind a distinct key per
+# session before invoking the agent; see gateway/run.py, tui_gateway/
+# server.py, cli.py). The turn id is the agent turn id
+# (``agent._current_turn_id``, ``<session>:<task>:<uuid8>`` generated fresh
+# per user turn in agent/turn_context.py), threaded explicitly by producers
+# and via the ``_approval_turn_id`` ContextVar during tool dispatch.
+# Unrelated sessions can never share a key; the empty-turn fallback
+# (``""``) is used only by bare/test paths that have no turn, and taint
+# there is still session-scoped, so it can only ever ADD approval friction
+# inside that session — never silently authorize another session.
+#
+# The store is deny-biased by construction: its only power is forcing the
+# human gate (with smart/LLM auto-approval suppressed). A leak, duplicate,
+# or stale entry produces extra prompts, never silent execution.
+_TAINT_KEY_PREFIX = "taint:"
+_TAINT_KEY = "taint:untrusted-context"
+_turn_taint: dict[tuple[str, str], dict] = {}
+_taint_seq = 0
+# Bound the store: keep only recent turns per session.
+_TAINT_MAX_TURNS_PER_SESSION = 8
+_TAINT_MAX_ENTRIES = 512
+
+# Findings that alone are too weak to taint a turn (no instruction intent).
+_TAINT_WEAK_FINDING_PREFIX = "invisible_unicode_"
+
+
+def _findings_warrant_taint(findings) -> bool:
+    """True when any finding shows instruction-level attacker intent."""
+    for finding in findings or []:
+        if not str(finding).startswith(_TAINT_WEAK_FINDING_PREFIX):
+            return True
+    return False
+
+
+def _resolve_taint_scope(
+    session_key: str | None = None,
+    turn_id: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the (session, turn) scope for taint reads/writes."""
+    if session_key is None:
+        session_key = get_current_session_key()
+    if turn_id is None:
+        try:
+            turn_id = _approval_turn_id.get() or ""
+        except Exception:
+            turn_id = ""
+    return (session_key or "", turn_id or "")
+
+
+def _evict_old_turn_taint(session_key: str) -> None:
+    """Bound per-session taint history (oldest turns first)."""
+    if len(_turn_taint) <= _TAINT_MAX_ENTRIES:
+        return
+    session_keys = sorted(
+        (key for key in _turn_taint if key[0] == session_key),
+        key=lambda key: _turn_taint[key].get("seq", 0),
+    )
+    for key in session_keys[: -_TAINT_MAX_TURNS_PER_SESSION]:
+        _turn_taint.pop(key, None)
+    while len(_turn_taint) > _TAINT_MAX_ENTRIES:
+        oldest = min(_turn_taint, key=lambda key: _turn_taint[key].get("seq", 0))
+        _turn_taint.pop(oldest, None)
+
+
+def note_turn_taint(
+    session_key: str | None,
+    turn_id: str | None,
+    findings,
+    *,
+    source: str = "turn",
+) -> bool:
+    """Record provenance taint for a (session, turn). Returns True if stored.
+
+    Weak-only findings (lone invisible-unicode) are ignored so benign
+    content never taints a turn. Recording is idempotent: repeated notes
+    merge findings without changing authorization semantics.
+    """
+    if not _findings_warrant_taint(findings):
+        return False
+    scope = _resolve_taint_scope(session_key, turn_id)
+    global _taint_seq
+    with _lock:
+        entry = _turn_taint.get(scope)
+        if entry is None:
+            _taint_seq += 1
+            _turn_taint[scope] = {
+                "findings": sorted({str(finding) for finding in findings or []}),
+                "source": source,
+                "seq": _taint_seq,
+            }
+        else:
+            merged = sorted(set(entry["findings"]) | {str(f) for f in findings or []})
+            entry["findings"] = merged
+        _evict_old_turn_taint(scope[0])
+    return True
+
+
+def current_turn_taint(
+    session_key: str | None = None,
+    turn_id: str | None = None,
+) -> dict | None:
+    """Return the taint record for a (session, turn), or None if clean."""
+    scope = _resolve_taint_scope(session_key, turn_id)
+    with _lock:
+        entry = _turn_taint.get(scope)
+        return dict(entry) if entry is not None else None
+
+
+def clear_turn_taint(
+    session_key: str | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Remove taint for a (session, turn). Used by session teardown/tests."""
+    scope = _resolve_taint_scope(session_key, turn_id)
+    with _lock:
+        _turn_taint.pop(scope, None)
+
+
+def clear_session_taint(session_key: str) -> None:
+    """Remove taint for every turn of a session (session end)."""
+    with _lock:
+        for key in [key for key in _turn_taint if key[0] == (session_key or "")]:
+            _turn_taint.pop(key, None)
+
+
+# Delegation inheritance: staged taint for not-yet-started
+# child turns. A tainted parent stages its findings under the CHILD's
+# session key at spawn time; the child claims them into its own initial
+# turn at turn start (one-shot consume). Nothing is global, nothing
+# persists beyond the first turn unless history legitimately reseeds it,
+# and no model-controlled input can write, clear, or redirect this store.
+_inherited_taint: dict[str, dict] = {}
+_INHERITED_MAX_ENTRIES = 128
+
+
+def stage_child_taint(child_session_key: str, findings) -> bool:
+    """Stage parent taint for a child's initial turn. Returns True if stored.
+
+    Called once at delegation/spawn time with the parent's active findings.
+    Clean parents (no warranting findings) stage nothing. Model input never
+    reaches this function — findings come from the ambient parent taint
+    record, and the key is the child's own session id.
+    """
+    if not child_session_key or not _findings_warrant_taint(findings):
+        return False
+    global _taint_seq
+    with _lock:
+        _taint_seq += 1
+        _inherited_taint[child_session_key] = {
+            "findings": sorted({str(finding) for finding in findings or []}),
+            "seq": _taint_seq,
+        }
+        while len(_inherited_taint) > _INHERITED_MAX_ENTRIES:
+            oldest = min(
+                _inherited_taint,
+                key=lambda key: _inherited_taint[key].get("seq", 0),
+            )
+            _inherited_taint.pop(oldest, None)
+    return True
+
+
+def has_staged_inheritance(session_key: str) -> bool:
+    """Peek (no consume) whether inheritance is staged for a session.
+
+    Takes an explicit key and never touches ambient context, so the check
+    itself is near-infallible. Empty keys are never staged: return False.
+    """
+    if not session_key:
+        return False
+    with _lock:
+        return session_key in _inherited_taint
+
+
+def claim_inherited_taint(
+    session_key: str | None,
+    turn_id: str | None,
+) -> bool:
+    """Consume staged inheritance into a (session, turn). One-shot.
+
+    Called at turn start with the starting agent's explicit session id, so
+    resolution never depends on ambient context that a child run may or may
+    not have bound yet. Returns True when an inheritance was claimed.
+    Later fresh turns find nothing staged and stay clean unless history
+    reseeds them through the normal path.
+
+    The staged entry is removed only after the taint is recorded: if
+    recording raises, the entry survives so a fail-closed caller can still
+    observe the pending inheritance instead of starting clean.
+    """
+    scope_session, scope_turn = _resolve_taint_scope(session_key, turn_id)
+    with _lock:
+        staged = _inherited_taint.get(scope_session)
+    if staged is None:
+        return False
+    recorded = note_turn_taint(
+        scope_session, scope_turn, staged.get("findings"), source="inherited"
+    )
+    if recorded:
+        with _lock:
+            _inherited_taint.pop(scope_session, None)
+    return recorded
+
+
+def inherit_parent_taint_to_child(child_session_key: str) -> bool:
+    """Spawn-boundary policy: inherit active parent taint into a child.
+
+    Reads the ambient parent (session, turn) taint and stages it for the
+    child's initial turn. Returns False when the parent turn is clean
+    (normal case — delegation proceeds unchanged).
+
+    Fail-closed: when the parent is known tainted but staging
+    fails for any reason, raises ``RuntimeError`` instead of letting the
+    child start clean. The parent-taint *read* itself is also fail-closed:
+    an unreadable parent record is unknown, not clean, and raises rather
+    than spawning a silent clean child. Callers must let this propagate —
+    it fails that one delegation tool call with an error, never a silent
+    clean child. Model input never reaches this function.
+    """
+    try:
+        parent_taint = current_turn_taint()
+    except Exception as exc:
+        raise RuntimeError(
+            "refusing child spawn: parent taint unreadable "
+            "(treating unknown as clean would be fail-open)"
+        ) from exc
+    if parent_taint is None:
+        return False
+    try:
+        staged = stage_child_taint(
+            child_session_key, parent_taint.get("findings")
+        )
+        if not staged:
+            raise RuntimeError("staging declined for child session")
+    except Exception as exc:
+        raise RuntimeError(
+            "refusing clean child spawn from tainted parent turn "
+            "(provenance staging failed)"
+        ) from exc
+    logger.debug(
+        "staged delegation taint for child session %s",
+        child_session_key,
+    )
+    return True
+
+
+def _resumable_tail_tool_messages(messages, cap: int) -> list:
+    """Tool messages belonging to the turn being resumed.
+
+    Taint is turn-scoped, so a fresh turn must never inherit taint merely
+    because old tool output remains in history. The only messages owned by
+    the resumed turn are trailing results the model has not responded to:
+
+    * a trailing run of ``tool``-role messages (interrupted after tool
+      execution, before the model saw the results), plus
+    * tool results exposed by skipping a trailing *dangling*
+      ``assistant(tool_calls)`` block (interrupted before execution;
+      replay strips it, exposing the previous results as the tail).
+
+    A tail of assistant text, a user message, or completed steps (every
+    tool block followed by an assistant message) means prior turns
+    completed — nothing is owned, nothing seeds. ``cap`` bounds the work.
+    """
+    if not messages or cap <= 0:
+        return []
+    idx = len(messages)
+    while idx > 0:
+        tail = messages[idx - 1]
+        if (
+            isinstance(tail, dict)
+            and tail.get("role") == "assistant"
+            and tail.get("tool_calls")
+        ):
+            # Dangling calls by construction: nothing follows them in the
+            # history, so no call was answered; replay removes them.
+            idx -= 1
+            continue
+        break
+    owned = []
+    while idx > 0 and len(owned) < cap:
+        message = messages[idx - 1]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            break
+        owned.append(message)
+        idx -= 1
+    owned.reverse()
+    return owned
+
+
+def _scan_tool_content_for_seed(content) -> list:
+    """Classify persisted tool content with the existing scanner.
+
+    Reuses the same ``context``-scope scan as live classification so only
+    content that would qualify as high-risk today can seed taint. Returns
+    warranting findings (possibly empty). Never raises: a scan failure
+    yields no findings here — live ingestion (withholding on
+    unprovenanced content) is the
+    conservative path for content that cannot be proven clean, while a
+    best-effort resume net must not break turn startup.
+    """
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [
+            item["text"]
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if not texts:
+            return []
+    else:
+        return []
+    try:
+        from tools.threat_patterns import scan_for_threats
+    except Exception:
+        return []
+    findings: list = []
+    try:
+        for text in texts:
+            for finding in scan_for_threats(text, scope="context"):
+                if finding not in findings:
+                    findings.append(finding)
+    except Exception:
+        return []
+    return [f for f in findings if _findings_warrant_taint([f])]
+
+
+def seed_turn_taint_from_history(
+    messages,
+    *,
+    session_key: str | None = None,
+    turn_id: str | None = None,
+    max_tool_messages: int = 50,
+) -> bool:
+    """Reconstruct taint from persisted or in-memory history.
+
+    Resume/restart/compaction safety net: the session database persists
+    message *content* but drops the transient ``_tool_output_risk`` key, so
+    re-derivation must come from the content that actually survived.
+    Messages carrying recorded high-risk metadata seed directly; messages
+    without it are re-scanned with the existing scanner. Only content that
+    qualifies as high-risk under current scanner semantics seeds taint;
+    clean and low-risk history stays clean. Taint still expires with the
+    turn. Deterministic from history bytes — no mutable persisted flag is
+    trusted.
+
+    Turn ownership: only the resumable tail — trailing tool
+    results no assistant message has responded to (plus results exposed by
+    skipping a trailing dangling ``assistant(tool_calls)`` block) — can
+    seed. Completed turns (assistant/user tail) seed nothing, so a fresh
+    turn after a malicious-but-answered turn stays clean. ``cap`` is
+    ``max_tool_messages``.
+    """
+    if not messages:
+        return False
+    scope_session, scope_turn = _resolve_taint_scope(session_key, turn_id)
+    owned = _resumable_tail_tool_messages(messages, max_tool_messages)
+    seeded = False
+    for message in owned:
+        findings = None
+        risk_metadata = message.get("_tool_output_risk")
+        if isinstance(risk_metadata, dict) and risk_metadata.get("risk") == "high":
+            findings = risk_metadata.get("findings")
+        else:
+            # Transient metadata lost (restart/compaction): re-derive from
+            # the persisted content itself.
+            findings = _scan_tool_content_for_seed(message.get("content"))
+        if findings and note_turn_taint(
+            scope_session, scope_turn, findings,
+            source="history",
+        ):
+            seeded = True
+    return seeded
+
+
+def _explicit_taint_record(risk_metadata) -> dict | None:
+    """Build a taint record from an explicitly passed risk dict, if warranting."""
+    if not isinstance(risk_metadata, dict):
+        return None
+    findings = risk_metadata.get("findings") or []
+    if risk_metadata.get("risk") == "low" and not findings:
+        return None
+    if not _findings_warrant_taint(findings):
+        return None
+    global _taint_seq
+    with _lock:
+        _taint_seq += 1
+        seq = _taint_seq
+    return {
+        "findings": sorted({str(finding) for finding in findings}),
+        "source": "explicit",
+        "seq": seq,
+    }
+
+
+def _resolve_guard_taint(risk_metadata) -> dict | None:
+    """Taint visible to an authorization guard: explicit kwarg wins, else ambient."""
+    explicit = _explicit_taint_record(risk_metadata)
+    if explicit is not None:
+        return explicit
+    return current_turn_taint()
+
+
+def _is_taint_exempt_command(command: str) -> bool:
+    """Pure-local metadata commands stay frictionless even on tainted turns.
+
+    ``ls``/``dir``/``pwd`` without shell operators cannot read file content,
+    exfiltrate, or mutate — gating them would only train users to approve
+    blindly. Anything composed (pipes, separators, substitutions) is gated.
+    """
+    text = (command or "").strip()
+    first = re.split(r"\s+", text, maxsplit=1)[0].lower() if text else ""
+    if first not in ("ls", "dir", "pwd"):
+        return False
+    if re.search(r"[;&|$()`]", text):
+        return False
+    return True
+
+
+def _taint_description(taint: dict) -> str:
+    findings = ", ".join(taint.get("findings", [])[:4]) or "prompt injection"
+    return (
+        "untrusted high-risk context this turn "
+        f"({findings}). The current context contains attacker-controlled "
+        "content flagged as prompt injection, so this action needs explicit "
+        "human authorization even though the command itself looks safe."
+    )
+
+# =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
 # =========================================================================
 # Per-session QUEUE of pending approvals.  Multiple threads (parallel
@@ -3172,7 +3740,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             risk_metadata=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -3183,6 +3752,12 @@ def check_all_command_guards(command: str, env_type: str,
     ``has_host_access`` is True when a Docker sandbox bind-mounts host paths;
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
+
+    ``risk_metadata`` is an optional explicit provenance record
+    (``{"findings": [...], "risk": ...}``) for the current turn. It is set
+    only by Hermes's own tool entries from ambient taint state — never from
+    model-supplied tool arguments. When omitted, ambient turn taint for the
+    active (session, turn) scope is consulted instead.
     """
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
@@ -3227,12 +3802,30 @@ def check_all_command_guards(command: str, env_type: str,
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
+    # Provenance + sensitive-read inputs. Resolved AFTER the yolo /
+    # mode=off / permanent-allowlist bypasses (explicit user opt-outs win),
+    # but BEFORE any auto-approve path below. ``taint`` is a taint record
+    # (explicit kwarg wins, else ambient turn taint) or None when clean.
+    # ``extra_warnings`` feeds both the headless fail-closed branch and the
+    # Phase-1 warning list, so human and headless paths see identical inputs.
+    taint = _resolve_guard_taint(risk_metadata)
+    taint_source = taint.get("source") if taint is not None else None
+    is_sensitive_read, sensitive_key, sensitive_desc = _detect_sensitive_read(command)
+    extra_warnings = []
+    if taint is not None and not _is_taint_exempt_command(command):
+        extra_warnings.append((_TAINT_KEY, _taint_description(taint), False))
+    if is_sensitive_read:
+        extra_warnings.append((sensitive_key, sensitive_desc, False))
+    needs_human = bool(extra_warnings)
+
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
-    # flows, we do not block on approvals and we skip external guard work.
+    # flows, we do not block on approvals and we skip external guard work —
+    # EXCEPT for tainted turns and sensitive reads, which fail closed when no
+    # human can answer (cron honors cron_mode instead).
     if not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
@@ -3276,6 +3869,10 @@ def check_all_command_guards(command: str, env_type: str,
                     # be silently allowed — and a cron session has no user to
                     # approve it, so fail-closed means block (mirrors the
                     # fail-closed synthesis in the main flow below; see #20733).
+                    # Note: cron_mode=approve is handled OUTSIDE this branch by
+                    # the outer ``if needs_human`` block below — it skips the
+                    # entire cron-deny block when cron_mode != "deny", so the
+                    # trust-the-cron-profile semantics live there, not here.
                     _cron_fail_open = True  # safe default if config is unreadable
                     try:
                         from hermes_cli.config import load_config as _load_cfg
@@ -3296,7 +3893,45 @@ def check_all_command_guards(command: str, env_type: str,
                                 "approvals.cron_mode: approve in config.yaml."
                             ),
                         }
-                    # else: tirith_fail_open is True — allow as before
+                    # else: tirith_fail_open is True — fall through; the
+                    # outer ``if needs_human`` below handles tainted/sensitive
+                    # reads correctly (cron-deny must block them, not allow
+                    # them just because tirith is unavailable).
+                if needs_human:
+                    _cron_extra_desc = "; ".join(
+                        desc for _, desc, _ in extra_warnings
+                    )
+                    return {
+                        "approved": False,
+                        "message": (
+                            f"BLOCKED: {_cron_extra_desc} "
+                            "but cron jobs run without a user present to approve it. "
+                            "Find an alternative approach that avoids this command. "
+                            "To allow flagged actions in cron jobs, set "
+                            "approvals.cron_mode: approve in config.yaml."
+                        ),
+                        "taint_source": taint_source,
+                    }
+        if needs_human:
+            if env_var_enabled("HERMES_CRON_SESSION"):
+                # cron_mode == "approve" explicitly trusts this cron profile —
+                # fall through to allow below.
+                if _get_cron_approval_mode() != "deny":
+                    return {"approved": True, "message": None}
+            _denied_desc = "; ".join(desc for _, desc, _ in extra_warnings)
+            logger.warning(
+                "Blocked tainted/sensitive command with no approval surface: %s",
+                command[:200],
+            )
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: {_denied_desc} No interactive user or gateway "
+                    "is present to approve it. Do NOT retry it, do NOT rephrase "
+                    "it, and do NOT attempt the same outcome via a different path."
+                ),
+                "taint_source": taint_source,
+            }
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -3369,6 +4004,13 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
+    # Provenance + sensitive-read warnings. Session-approval short-circuit
+    # mirrors the tirith/dangerous entries above: an explicit per-pattern
+    # human decision still satisfies its own warning.
+    for extra_key, extra_desc, extra_is_tirith in extra_warnings:
+        if not is_approved(session_key, extra_key):
+            warnings.append((extra_key, extra_desc, extra_is_tirith))
+
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
@@ -3377,8 +4019,11 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
+    # Tainted turns skip smart auto-approval entirely: the aux LLM would be
+    # judging an attacker-shaped command, which reintroduces model trust
+    # into the authorization path. A human always decides.
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and taint is None:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -3417,6 +4062,11 @@ def check_all_command_guards(command: str, env_type: str,
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
+    # Taint warnings behave like tirith warnings for persistence: broad
+    # permanent allowlisting of an untrusted-context gate is inappropriate,
+    # so the UI must not offer a permanent scope and "always" degrades to
+    # session scope for taint keys.
+    has_taint = any(key.startswith(_TAINT_KEY_PREFIX) for key in all_keys)
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous
@@ -3447,7 +4097,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "description": redact_sensitive_text(combined_desc),
                 # Smart DENY overrides are one-operation decisions, so the UI
                 # must not offer a permanent scope.
-                "allow_permanent": not has_tirith and not smart_denied_for_owner,
+                "allow_permanent": not has_tirith and not has_taint and not smart_denied_for_owner,
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
@@ -3508,6 +4158,12 @@ def check_all_command_guards(command: str, env_type: str,
             # choices retain their existing persistence semantics.
             if not smart_denied_for_owner:
                 for key, _, is_tirith in warnings:
+                    # taint:* keys are one-shot by design — a tainted
+                    # turn's approval never persists, so a later tainted
+                    # command on the same session still requires a fresh
+                    # human decision. Ordinary keys retain existing behavior.
+                    if key.startswith(_TAINT_KEY_PREFIX):
+                        continue
                     if choice == "session" or (choice == "always" and is_tirith):
                         approve_session(session_key, key)
                     elif choice == "always":
@@ -3516,7 +4172,8 @@ def check_all_command_guards(command: str, env_type: str,
                         save_permanent_allowlist(_permanent_approved)
 
             return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+                    "user_approved": True, "description": combined_desc,
+                    **({"taint_source": taint_source} if has_taint else {})}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat. Redact secrets in the
@@ -3533,6 +4190,9 @@ def check_all_command_guards(command: str, env_type: str,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
+        if has_taint:
+            # Tainted approvals are one-shot: never offer a permanent scope.
+            pending_data.update(allow_permanent=False)
         submit_pending(session_key, pending_data)
         result = {
             "approved": False,
@@ -3563,7 +4223,7 @@ def check_all_command_guards(command: str, env_type: str,
     choice = prompt_dangerous_approval(
         command,
         combined_desc,
-        allow_permanent=not has_tirith and not smart_denied_for_owner,
+        allow_permanent=not has_tirith and not has_taint and not smart_denied_for_owner,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
     )
@@ -3599,6 +4259,10 @@ def check_all_command_guards(command: str, env_type: str,
     # persistence for manual mode and smart ESCALATE.
     if not smart_denied_for_owner:
         for key, _, is_tirith in warnings:
+            # taint:* keys are one-shot by design — never persist
+            # so a later tainted command still requires fresh authorization.
+            if key.startswith(_TAINT_KEY_PREFIX):
+                continue
             if choice == "session" or (choice == "always" and is_tirith):
                 # tirith: session only (no permanent broad allowlisting)
                 approve_session(session_key, key)
@@ -3609,11 +4273,13 @@ def check_all_command_guards(command: str, env_type: str,
                 save_permanent_allowlist(_permanent_approved)
 
     return {"approved": True, "message": None,
-            "user_approved": True, "description": combined_desc}
+            "user_approved": True, "description": combined_desc,
+            **({"taint_source": taint_source} if has_taint else {})}
 
 
 def check_execute_code_guard(code: str, env_type: str,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             risk_metadata=None) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
     execute_code runs arbitrary local Python — the script can call
@@ -3623,13 +4289,15 @@ def check_execute_code_guard(code: str, env_type: str,
     the script as a whole before it runs (#30882). Returns the same dict
     contract as ``check_all_command_guards``.
 
+    ``risk_metadata`` is an optional explicit provenance record, set only by
+    Hermes's own tool entries from ambient taint state — never from
+    model-supplied arguments. When omitted, ambient turn taint is consulted.
+
     Scope (documented limitation, #30882): in a purely local non-interactive
-    non-gateway session (no TTY, not gateway, not cron-deny) this returns
-    approved — matching the existing terminal auto-approve contract. The
-    hardline floor still blocks catastrophic ``terminal()`` commands the script
-    issues; running arbitrary code headlessly without any approval surface is
-    trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
-    require approval).
+    non-gateway session (no TTY, not gateway, not cron-deny) an UNTAINTED
+    script returns approved — matching the existing terminal auto-approve
+    contract. A TAINTED script fails closed instead: arbitrary Python is a
+    general capability that cannot be classified safe by inspection.
     """
     pattern_key = "execute_code"
     description = (
@@ -3651,6 +4319,12 @@ def check_execute_code_guard(code: str, env_type: str,
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
+
+    # Provenance: resolved after the yolo/mode=off opt-out above. A
+    # tainted script needs human authorization in every context below.
+    taint = _resolve_guard_taint(risk_metadata)
+    taint_source = taint.get("source") if taint is not None else None
+    tainted = taint is not None
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
@@ -3675,13 +4349,69 @@ def check_execute_code_guard(code: str, env_type: str,
             }
         return {"approved": True, "message": None}
 
-    # Only gateway/ask contexts get the one-shot whole-script approval.
-    #   * CLI interactive: the script's terminal() calls are guarded per-call
-    #     (context now propagates into the RPC thread, #33057); a whole-script
-    #     prompt would fire on every execute_code call.
-    #   * Local non-interactive non-gateway: documented limitation above.
+    # Only gateway/ask contexts get the one-shot whole-script approval —
+    # except on tainted turns, where every context with a human requires it.
+    #   * CLI interactive (untainted): the script's terminal() calls are
+    #     guarded per-call (context now propagates into the RPC thread,
+    #     #33057); a whole-script prompt would fire on every execute_code call.
+    #   * Local non-interactive non-gateway (untainted): documented limitation.
+    #   * Tainted CLI interactive: whole-script prompt below — the script can
+    #     exfiltrate via sockets, files, or RPC tools without ever touching
+    #     terminal(), so per-call guards are insufficient.
+    #   * Tainted with no human surface: fail closed (cron honors cron_mode).
     if not is_gateway and not is_ask:
-        return {"approved": True, "message": None}
+        if not tainted:
+            return {"approved": True, "message": None}
+        if _is_interactive_cli():
+            try:
+                from tools.terminal_tool import _get_approval_callback
+                _tainted_cli_cb = _get_approval_callback()
+            except Exception:
+                _tainted_cli_cb = None
+            from agent.redact import redact_sensitive_text
+            _tainted_display = redact_sensitive_text(code)
+            _tainted_choice = prompt_dangerous_approval(
+                f"execute_code <<'PY'\n{_tainted_display}\nPY",
+                description,
+                allow_permanent=False,
+                approval_callback=_tainted_cli_cb,
+            )
+            if _tainted_choice == "deny":
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: execute_code script denied by user. The user "
+                        "has NOT consented to running this code. Do NOT retry, "
+                        "do NOT rephrase the script, and do NOT attempt the same "
+                        "outcome via a different tool."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "denied",
+                    "user_consent": False,
+                    "taint_source": taint_source,
+                }
+            # Tainted approvals are one-shot: "session"/"always" choices are
+            # honored for this run only and never persisted.
+            logger.info("Tainted execute_code approved one-shot by user.")
+            return {"approved": True, "message": None,
+                    "user_approved": True, "description": description,
+                    "taint_source": taint_source}
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code runs arbitrary local Python on a turn "
+                "whose context contains untrusted high-risk content, but no "
+                "interactive user or gateway is present to approve it. "
+                "Do NOT retry, do NOT rephrase the script, and do NOT attempt "
+                "the same outcome via a different tool."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "blocked",
+            "user_consent": False,
+            "taint_source": taint_source,
+        }
 
     session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval
@@ -3691,14 +4421,17 @@ def check_execute_code_guard(code: str, env_type: str,
     # Check session/permanent approval — same gate as check_all_command_guards.
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
-    if is_approved(session_key, pattern_key):
+    # Tainted scripts always require a fresh human decision.
+    if not tainted and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
     # guards (restored by context propagation) still run independently.
+    # Tainted scripts skip smart auto-approval: the aux LLM would judge an
+    # attacker-shaped script. A human always decides.
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not tainted:
         observer_payload = _prepare_smart_approval_observer(
             command=command,
             description=description,
@@ -3756,6 +4489,9 @@ def check_execute_code_guard(code: str, env_type: str,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
+        if tainted:
+            # Tainted approvals are one-shot: never offer a permanent scope.
+            pending_data.update(allow_permanent=False)
         submit_pending(session_key, pending_data)
         result = {
             "approved": False,
@@ -3778,7 +4514,7 @@ def check_execute_code_guard(code: str, env_type: str,
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": display_description,
-        "allow_permanent": not smart_denied_for_owner,
+        "allow_permanent": not smart_denied_for_owner and not tainted,
     }
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
@@ -3824,7 +4560,8 @@ def check_execute_code_guard(code: str, env_type: str,
     # Never persist a smart-DENY override under the coarse execute_code key;
     # doing so would approve unrelated future scripts. Manual and ESCALATE
     # decisions preserve their existing session/permanent behavior.
-    if not smart_denied_for_owner:
+    # Tainted approvals are one-shot on top of that: nothing persists.
+    if not smart_denied_for_owner and not tainted:
         if choice == "session":
             approve_session(session_key, pattern_key)
         elif choice == "always":
@@ -3834,7 +4571,8 @@ def check_execute_code_guard(code: str, env_type: str,
     # choice == "once": no persistence — approval lasts this single call only.
 
     return {"approved": True, "message": None,
-            "user_approved": True, "description": description}
+            "user_approved": True, "description": description,
+            "taint_source": taint_source}
 
 
 # =========================================================================

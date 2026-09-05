@@ -1004,6 +1004,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -1688,7 +1689,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name, _tool_content, tool_call.id,
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if (

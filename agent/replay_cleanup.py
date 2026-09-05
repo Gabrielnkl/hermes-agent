@@ -173,6 +173,9 @@ def strip_dangling_tool_call_tail(
             )
             recovered.append(make_tool_result_message(
                 name, content, call_id, effect_disposition=disposition,
+                # Replay/sanitization rebuilds history without executing
+                # anything: it must never create authorization taint.
+                record_provenance=False,
             ))
         logger.warning(
             "Recovered dangling side-effecting tool call(s) as UNKNOWN instead of erasing them"

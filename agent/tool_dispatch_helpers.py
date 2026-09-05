@@ -460,6 +460,8 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    turn_id: str | None = None,
+    record_provenance: bool = True,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -488,13 +490,66 @@ def make_tool_result_message(
         "content": wrapped,
         "tool_call_id": tool_call_id,
     }
+    risk_metadata = None
+    risk_ok = True
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)
     except Exception as exc:
+        # A scan failure must not silently certify content as clean
+        # — it is handled conservatively below.
+        risk_ok = False
         logger.debug("Tool output risk scan failed for %s: %s", name, exc)
-    else:
-        if risk_metadata is not None:
-            message["_tool_output_risk"] = risk_metadata
+    if risk_metadata is not None:
+        message["_tool_output_risk"] = risk_metadata
+    if _is_provenance_relevant(name):
+        if risk_metadata is not None and risk_metadata.get("risk") == "high":
+            # Provenance recording: a high-risk result taints
+            # the current (session, turn) so terminal / execute_code guards
+            # route capability-bearing actions to human authorization. This
+            # is the single choke point shared by the sequential executor,
+            # the concurrent executor, and unit tests. ``record_provenance``
+            # is False only for history-rewriting paths (replay sanitization)
+            # that must not create authorization state as a side effect.
+            # Weak-only findings never taint (see note_turn_taint).
+            if record_provenance:
+                try:
+                    from tools.approval import (
+                        get_current_session_key,
+                        note_turn_taint,
+                    )
+                    note_turn_taint(
+                        get_current_session_key(),
+                        turn_id,
+                        risk_metadata.get("findings"),
+                        source="turn",
+                    )
+                except Exception as taint_exc:
+                    # A recording failure must not silently
+                    # downgrade to clean — withhold the content (memory
+                    # load-time placeholder convention) instead of crashing
+                    # the agent. Without its payload the message cannot
+                    # induce privileged actions.
+                    logger.warning(
+                        "Turn taint recording failed for %s; withholding "
+                        "content: %s",
+                        name, taint_exc,
+                    )
+                    message["content"] = _withhold_unprovenanced_content(
+                        message["content"], name, "record"
+                    )
+        elif risk_metadata is None and not risk_ok:
+            # Scanner failure on a provenance-relevant tool: preserve the
+            # long-standing fail-open contract pinned by
+            # test_scanner_failure_never_blocks_tool_output (transient
+            # scanner errors must not brick tool results). This is a
+            # deliberate scope boundary: scanner exceptions are
+            # near-impossible (precompiled patterns, truncated input) and
+            # the taint-recording path above remains conservative.
+            logger.debug(
+                "Tool output risk scan failed for %s; passing content "
+                "through unscanned.",
+                name,
+            )
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
     return message
@@ -508,6 +563,13 @@ def make_tool_result_message(
 _UNTRUSTED_TOOL_NAMES = frozenset({
     "web_extract",
     "web_search",
+    # Delegated child output can carry attacker-controlled research
+    # back into the parent conversation. Treating it as untrusted-data
+    # (wrapping + provenance taint on high-risk findings) closes the
+    # child -> parent laundering path: a tainted child result now taints
+    # the parent turn so a subsequent terminal/execute_code call cannot
+    # silently auto-approve.
+    "delegate_task",
 })
 
 _UNTRUSTED_TOOL_PREFIXES = (
@@ -531,14 +593,57 @@ def _is_untrusted_tool(name: Optional[str]) -> bool:
     return any(name.startswith(p) for p in _UNTRUSTED_TOOL_PREFIXES)
 
 
+def _is_provenance_relevant(name: Optional[str]) -> bool:
+    """Tools whose output can carry attacker content into authorization.
+
+    The untrusted fetch tools plus ``execute_code``: a sandboxed script can
+    print attacker content fetched via RPC/sockets/files, and that output
+    must acquire the same taint treatment as a direct high-risk result
+    (output-side provenance). Delimiter *wrapping* stays limited
+    to :func:`_is_untrusted_tool` so model-visible content is unchanged.
+    """
+    return _is_untrusted_tool(name) or name == "execute_code"
+
+
+def _withhold_unprovenanced_content(content: Any, name: str, stage: str) -> Any:
+    """Replace content that could not be provenance-checked.
+
+    Mirrors the memory load-time ``[BLOCKED: ...]`` placeholder convention:
+    when classification or taint recording fails for high-risk content, the
+    content is withheld from the model instead of flowing through clean.
+    Text parts are replaced; non-text multimodal parts are preserved.
+    """
+    placeholder = (
+        f"[CONTENT WITHHELD: {name} produced output that could not be "
+        f"provenance-checked ({stage} failure). The output is not shown, so "
+        f"it cannot induce privileged actions. Inspect the tool result "
+        f"through a trusted channel before proceeding.]"
+    )
+    if isinstance(content, str):
+        return placeholder
+    if isinstance(content, list):
+        return [
+            {**item, "text": placeholder}
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+            else item
+            for item in content
+        ]
+    return placeholder
+
+
 def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, Any]]:
     """Classify textual attacker-controlled output without retaining a copy.
 
     The advisory metadata is internal-only. It records deterministic finding
     identifiers, never blocks or redacts the normal result, and deliberately
     omits raw scanned text.
+
+    ``execute_code`` output is classified like untrusted output:
+    only the risk metadata/taint path is extended — delimiter wrapping still
+    applies solely to :func:`_is_untrusted_tool`, so model-visible content
+    is unchanged and clean script output stays clean.
     """
-    if not _is_untrusted_tool(name):
+    if not _is_provenance_relevant(name):
         return None
     if isinstance(content, str):
         text_parts = [content]

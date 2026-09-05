@@ -370,6 +370,52 @@ def build_turn_context(
     turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    # Provenance lifecycle: re-derive turn taint from recorded
+    # tool-result metadata at turn start, so resume/compaction (which drop
+    # the in-memory mark but keep history) starts tainted rather than
+    # silently clean. The fresh turn id expires prior taint by key.
+    # Delegation inheritance claim: consume taint staged
+    # for this session at spawn time into the fresh turn (one-shot). Uses
+    # the starting agent's explicit session id so resolution never depends
+    # on ambient context. Later fresh turns find nothing staged.
+    # Fail-closed: if this block raises while inheritance is
+    # actually pending for this session, the error propagates instead of
+    # starting a silent clean child turn. Error handling is split below:
+    # seed and claim are independent; a seed failure must not mask a
+    # pending inheritance nor fail a turn with nothing staged.
+    try:
+        from tools.approval import (
+            claim_inherited_taint,
+            has_staged_inheritance,
+            seed_turn_taint_from_history,
+        )
+    except Exception:
+        # Approval subsystem unavailable: the guards live in the same
+        # module, so no guarded tool can run either — fail closed and loud
+        # rather than starting an unguardable turn.
+        raise
+    try:
+        seed_turn_taint_from_history(
+            conversation_history or [],
+            turn_id=turn_id,
+        )
+    except Exception:
+        # Seed failure: best-effort safety net only (scanner half is
+        # explicitly fail-open, H-2). Log and still run the claim below.
+        logger.debug("turn taint seeding skipped", exc_info=True)
+    try:
+        claim_inherited_taint(getattr(agent, "session_id", None), turn_id)
+    except Exception:
+        try:
+            _inheritance_pending = has_staged_inheritance(
+                getattr(agent, "session_id", None) or ""
+            )
+        except Exception:
+            # Cannot prove clean: assume pending rather than downgrade.
+            _inheritance_pending = True
+        if _inheritance_pending:
+            raise
+        logger.debug("inherited taint claim skipped", exc_info=True)
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.
