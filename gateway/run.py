@@ -5256,7 +5256,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     def _recover_pending() -> None:
         from gateway.shutdown_flush import recover_pending_to_db
-        recovered = recover_pending_to_db()
+        # The routing index is loaded by runner.start(); pass it so spool files carrying
+        # only a session_key (production MessageEvents have no session_id) resolve.
+        recovered = recover_pending_to_db(session_store=getattr(runner, "session_store", None))
         if recovered:
             logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
 

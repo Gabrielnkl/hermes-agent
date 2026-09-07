@@ -198,10 +198,61 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
-def recover_pending_to_db(session_db=None) -> int:
+def _live_session_store():
+    """The running gateway's SessionStore, or None (tests / no live runner).
+
+    ``gateway.run._gateway_runner_ref`` is the established accessor (same pattern as
+    ``gateway/platforms/api_server.py``); the store is read-only here (``peek_session_id``)."""
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        return None
+    return getattr(runner, "session_store", None)
+
+
+def _resolve_session_id(session_store, session_key: str) -> Optional[str]:
+    """``session_key`` -> ``session_id`` via the live routing index; None when unresolvable.
+
+    ``peek_session_id`` lazy-loads the persisted routing index (state.db ``gateway_routing`` +
+    legacy sessions.json), so this is safe at startup recovery. Any failure resolves to None
+    (file kept) rather than raising.
+    """
+    if not session_store or not session_key:
+        return None
+    peek = getattr(session_store, "peek_session_id", None)
+    if not callable(peek):
+        return None
+    try:
+        result = peek(session_key)
+    except Exception as exc:
+        logger.debug("session_key resolution failed for %s: %s", session_key, exc)
+        return None
+    return result or None
+
+
+def _payload_order_key(payload: Dict[str, Any], path: Path) -> tuple:
+    """Deterministic replay order: flush time, then per-session arrival ``seq``, then name.
+
+    Overflow payloads carry ``seq`` (arrival order within one session); filenames are random
+    uuids, so raw path sorting would replay a burst out of order.
+    """
+    def _num(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+    payload = payload if isinstance(payload, dict) else {}
+    return (_num(payload.get("ts")), _num(payload.get("seq")), path.name)
+
+
+def recover_pending_to_db(session_db=None, session_store=None) -> int:
     """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
 
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
+    ``session_store=None`` resolves the live gateway's store (recovery runs after
+    ``runner.start()``); an explicit store is used verbatim. Files whose session cannot be
+    resolved, or whose append fails, are kept for a later recovery — never deleted.
     Returns the number of messages recovered.
     """
     flush_files = sorted(_get_flush_dir().glob("*.json"))
@@ -211,16 +262,33 @@ def recover_pending_to_db(session_db=None) -> int:
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
+    if session_store is None:
+        session_store = _live_session_store()
     recovered = 0
     try:
+        entries = []
         for path in flush_files:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("Cannot parse pending spool file %s; preserved for manual "
+                               "inspection: %s", path, exc)
+                continue
             # Agent-history snapshots are for manual operator recovery, not automatic DB insertion.
             if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                 continue
-            if _recover_one_payload(session_db, path, payload):
-                recovered += 1
-                path.unlink(missing_ok=True)
+            entries.append((_payload_order_key(payload, path), path, payload))
+        for _, path, payload in sorted(entries, key=lambda e: e[0]):
+            try:
+                if _recover_one_payload(session_db, path, payload, session_store):
+                    recovered += 1
+                    path.unlink(missing_ok=True)
+            except Exception as exc:
+                # One bad payload must not abort the whole sweep; the file is kept.
+                # BaseExceptions (KeyboardInterrupt/SystemExit) still propagate.
+                logger.warning("Recovery of pending spool file %s failed; preserved for "
+                               "retry: %s", path, exc)
+                continue
     finally:
         if own_db:  # shutdown cancellation/interrupt must not strand an owned DB
             with contextlib.suppress(Exception):
@@ -231,7 +299,8 @@ def recover_pending_to_db(session_db=None) -> int:
     return recovered
 
 
-def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> bool:
+def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any],
+                         session_store=None) -> bool:
     """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
@@ -248,21 +317,35 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
                                   timestamp=message.get("timestamp") or payload.get("ts"))
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
+    if not isinstance(data, dict):
+        logger.warning("Cannot recover structurally invalid pending message from %s; "
+                       "the flush file has been preserved", path)
+        return False
     text = data.get("text", "")
     if not text or not session_key:
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)
         return False
     # session_key is a gateway routing key (e.g. "agent:main:telegram:..."); appending a row
-    # needs the real session_id, which only the serialised data can supply at this stage.
-    session_id = data.get("session_id", "")
+    # needs the real session_id. Legacy spool files carry it in ``data``; current files
+    # resolve it from the live routing index (recovery runs after ``runner.start()``).
+    # A production MessageEvent has no ``session_id`` attribute, so its absence is the
+    # normal case, not a corrupt file.
+    session_id = data.get("session_id", "") or _resolve_session_id(session_store, session_key) or ""
     if not session_id:
-        logger.warning("Cannot recover pending message for %s: no session_id in flush file and "
-                       "session_key-to-id resolution is not available at this recovery stage. "
-                       "The message text is preserved in %s", session_key, path)
+        logger.warning("Cannot recover pending message for %s: session_key has no live "
+                       "routing entry; the spool file is preserved for a later recovery",
+                       session_key)
         return False
-    session_db.append_message(session_id=session_id, role="user", content=text,
-                              timestamp=payload.get("ts", int(time.time())))
+    try:
+        session_db.append_message(session_id=session_id, role="user", content=text,
+                                  timestamp=payload.get("ts", int(time.time())))
+    except Exception as exc:
+        # The DB may still be unhealthy (e.g. FTS corruption); keep the file for retry.
+        # BaseExceptions (KeyboardInterrupt/SystemExit) still propagate.
+        logger.warning("Replay of pending message for %s failed; keeping spool file for "
+                       "retry: %s", session_key, exc)
+        return False
     return True
 
 

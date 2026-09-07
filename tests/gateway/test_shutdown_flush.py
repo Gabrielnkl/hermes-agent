@@ -238,3 +238,110 @@ def test_flushed_overflow_is_replayed_by_recover_pending_to_db(tmp_path, monkeyp
 def test_flush_overflow_noop_on_empty():
     assert flush_overflow_to_file({}) == 0
     assert flush_overflow_to_file({"k": []}) == 0
+
+
+# ── Real-MessageEvent round-trip (no MagicMock event) ────────────────────
+# A production MessageEvent has no ``session_id`` attribute, so the spool
+# payload carries only ``text`` under ``data`` plus the top-level
+# ``session_key``. Recovery must resolve the session id from that key.
+
+
+def _real_event(text: str):
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="123", chat_type="dm",
+        user_id="u1", user_name="Bob",
+    )
+    return MessageEvent(
+        text=text, message_type=MessageType.TEXT, source=source, message_id="m99",
+    )
+
+
+class _FakeSessionStore:
+    """Minimal session_key -> session_id resolver (mirrors peek_session_id)."""
+
+    def __init__(self, mapping):
+        self._mapping = dict(mapping)
+
+    def peek_session_id(self, session_key):
+        return self._mapping.get(session_key)
+
+
+class _FakeDB:
+    def __init__(self):
+        self.calls = []
+
+    def append_message(self, **kwargs):
+        self.calls.append(kwargs)
+        return len(self.calls)
+
+
+def test_real_event_pending_round_trip_via_session_key(tmp_path, monkeypatch):
+    """Real MessageEvent flush -> recovery appends via session_key resolution."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    count = flush_pending_to_file(
+        {"agent:main:telegram:dm:123": _real_event("queued while busy")},
+        reason="shutdown",
+    )
+    assert count == 1
+    payload = json.loads(next(flush_dir.glob("*.json")).read_text(encoding="utf-8"))
+    assert payload["data"].get("session_id") in (None, "")
+    assert payload["session_key"] == "agent:main:telegram:dm:123"
+
+    db = _FakeDB()
+    store = _FakeSessionStore({"agent:main:telegram:dm:123": "20260728_120000_abc"})
+    recovered = recover_pending_to_db(session_db=db, session_store=store)
+    assert recovered == 1
+    assert len(db.calls) == 1
+    assert db.calls[0]["session_id"] == "20260728_120000_abc"
+    assert db.calls[0]["role"] == "user"
+    assert db.calls[0]["content"] == "queued while busy"
+    assert list(flush_dir.glob("*.json")) == []
+
+
+def test_real_event_overflow_round_trip_via_session_key(tmp_path, monkeypatch):
+    """Overflow-flushed real events recover through the same session_key path."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    count = flush_overflow_to_file(
+        {"agent:main:telegram:dm:123": [_real_event("overflow-1"), _real_event("overflow-2")]},
+        reason="shutdown",
+    )
+    assert count == 2
+
+    db = _FakeDB()
+    store = _FakeSessionStore({"agent:main:telegram:dm:123": "20260728_120000_abc"})
+    recovered = recover_pending_to_db(session_db=db, session_store=store)
+    assert recovered == 2
+    assert [c["content"] for c in db.calls] == ["overflow-1", "overflow-2"]
+    assert list(flush_dir.glob("*.json")) == []
+
+
+def test_real_event_carries_no_session_id_guard():
+    """Pin the production shape: a real MessageEvent has no session_id attribute and
+    serialises without one — tests must not rely on a mock-manufactured session_id."""
+    event = _real_event("guard")
+    assert not hasattr(event, "session_id")
+    assert _serialise_value(event) == {"text": "guard"}
+
+
+def test_unresolvable_session_key_keeps_spool_file(tmp_path, monkeypatch):
+    """A session_key with no mapping must NOT be deleted (still recoverable)."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    assert flush_pending_to_file(
+        {"agent:main:telegram:dm:123": _real_event("orphaned")}, reason="shutdown",
+    ) == 1
+
+    db = _FakeDB()
+    recovered = recover_pending_to_db(session_db=db, session_store=_FakeSessionStore({}))
+    assert recovered == 0
+    assert db.calls == []
+    assert len(list(flush_dir.glob("*.json"))) == 1
