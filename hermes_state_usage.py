@@ -284,8 +284,10 @@ class SessionUsageMixin:
         where the cached agent holds cumulative totals)."""
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         # Ensure the row exists: under concurrent load create_session() may have failed on
-        # locking, and the UPDATE would silently affect 0 rows.
-        self._insert_session_row(session_id, "unknown", model=model)
+        # locking, and the UPDATE would silently affect 0 rows. ``ensure_exists=False`` keeps
+        # a stale async delta from resurrecting a session the user just deleted as a phantom
+        # ``source='unknown'`` row with no transcript.
+        self._insert_session_row(session_id, "unknown", model=model, ensure_exists=False)
         sql = _TOKEN_UPDATE_ABSOLUTE_SQL if absolute else _TOKEN_UPDATE_DELTA_SQL
         has_usage = bool(input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or reasoning_tokens
                          or api_call_count or estimated_cost_usd)
@@ -312,7 +314,13 @@ class SessionUsageMixin:
             row = conn.execute(
                 "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?", (session_id,),
             ).fetchone()
-            existing = dict(row) if row is not None else {}
+            if row is None:
+                # Session row was deleted between the ensure_exists check and the UPDATE.
+                # A stale per-turn delta must not resurrect it; the matching session_model_usage
+                # INSERT below would also fail its FK constraint. Drop the delta silently —
+                # accounting loss is logged, never raised into a turn (mirrors #23270).
+                return
+            existing = dict(row)
             # create_session records the requested route before any API call. If that fails
             # and fallback succeeds, the first accounted usage is the authoritative route;
             # after that keep the row as is (one row cannot represent mixed usage).
@@ -380,9 +388,19 @@ class SessionUsageMixin:
         if not session_id or not task:
             return
         usage["api_call_count"] = 1 if api_call_count is None else int(api_call_count)
-        # FK to sessions.id: same INSERT OR IGNORE guard as update_token_counts.
-        self._insert_session_row(session_id, "unknown")
-        self._execute_write(lambda conn: self._record_model_usage(conn, session_id, task=task, **usage))
+        # FK to sessions.id: same ensure_exists=False guard as update_token_counts — a stale
+        # async delta must not resurrect a session the user just deleted as a phantom
+        # source='unknown' row with no transcript.
+        self._insert_session_row(session_id, "unknown", ensure_exists=False)
+        def _do(conn):
+            if conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+                # Session was deleted between the ensure_exists check and the INSERT.
+                # Bail before the FK trip on session_model_usage; the per-call delta is
+                # silently dropped (accounting loss is logged, never raised into a turn).
+                return
+            self._record_model_usage(conn, session_id, task=task, **usage)
+        self._execute_write(_do)
 
     def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
         """Tokens and spend across the whole store (one scan), so the sidebar total does not

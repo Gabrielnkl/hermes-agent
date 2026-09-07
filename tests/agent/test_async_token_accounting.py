@@ -9,6 +9,8 @@ thread while preserving update_token_counts() semantics exactly:
 3. flush_token_counts() gives readers read-your-writes (get_session and
    friends call it), and turn finalize / close() drain the queue.
 4. A failing apply is logged by the writer and never raises into a turn.
+5. A deleted session is not resurrected as a phantom source='unknown' row
+   when a stale async delta lands after the deletion.
 """
 
 import sqlite3
@@ -552,3 +554,107 @@ class TestCoalesceFieldContract:
             f"coalescing field lists reference kwargs update_token_counts "
             f"no longer accepts: {sorted(phantom)}"
         )
+
+
+# =========================================================================
+# Deleted-session resurrection guard
+# =========================================================================
+
+
+class TestDeletedSessionResurrection:
+    """A queued/sync token delta must NOT bring a deleted session back as a
+    phantom ``source='unknown'`` row with no transcript. The async writer
+    routinely processes deltas enqueued before the user deleted the session
+    (e.g. ``/new`` discarding an empty session right after a turn finished
+    its token accounting). The per-call sync path (``record_auxiliary_usage``
+    for vision/compression/title) has the same exposure.
+    """
+
+    def test_queued_token_delta_does_not_resurrect_deleted_session(
+            self, tmp_path, monkeypatch):
+        """Slow the writer so a delete can race its apply."""
+        db = SessionDB(db_path=tmp_path / "resurrect-async.db")
+        try:
+            db.create_session("s-deleted", source="cli")
+            db.end_session("s-deleted", "test_done")
+
+            original_apply = db._apply_token_batch
+
+            def slow_apply(batch):
+                time.sleep(0.5)
+                return original_apply(batch)
+
+            monkeypatch.setattr(db, "_apply_token_batch", slow_apply)
+
+            db.queue_token_counts(
+                "s-deleted", input_tokens=100, output_tokens=50, api_call_count=1,
+                model="anthropic/claude-opus-4.6", billing_provider="auto",
+            )
+
+            assert db.delete_session("s-deleted") is True
+            assert db.get_session("s-deleted") is None
+
+            time.sleep(1.0)
+
+            resurrected = db.get_session("s-deleted")
+            assert resurrected is None, (
+                "BUG: async token writer resurrected a deleted session as a "
+                f"phantom row. source={resurrected.get('source')!r}, "
+                f"model={resurrected.get('model')!r}"
+            )
+        finally:
+            db.close()
+
+    def test_sync_update_token_counts_does_not_resurrect_deleted_session(self, db):
+        db.create_session("s-deleted", source="cli")
+        db.end_session("s-deleted", "test_done")
+        assert db.delete_session("s-deleted") is True
+        assert db.get_session("s-deleted") is None
+
+        db.update_token_counts(
+            "s-deleted", input_tokens=200, output_tokens=75, api_call_count=1,
+            model="anthropic/claude-opus-4.6", billing_provider="auto",
+        )
+
+        assert db.get_session("s-deleted") is None, (
+            "BUG: update_token_counts resurrected a deleted session."
+        )
+
+    def test_record_auxiliary_usage_does_not_resurrect_deleted_session(self, db):
+        """Auxiliary usage (vision, compression, title) shares the same
+        session-row UPSERT and the same FK pressure on session_model_usage.
+        A stale aux call for a deleted session must be silently dropped."""
+        db.create_session("s-deleted", source="cli")
+        db.end_session("s-deleted", "test_done")
+        assert db.delete_session("s-deleted") is True
+
+        db.record_auxiliary_usage(
+            "s-deleted", task="vision",
+            model="anthropic/claude-opus-4.6", billing_provider="auto",
+            input_tokens=50, output_tokens=10, api_call_count=1,
+        )
+
+        assert db.get_session("s-deleted") is None, (
+            "BUG: record_auxiliary_usage resurrected a deleted session."
+        )
+
+    def test_existing_token_writes_still_succeed_when_session_is_live(self, db):
+        """Regression guard: ``ensure_exists=False`` must not break the
+        normal accounting path on a live session (the row was created
+        earlier and the UPDATE is the authoritative accounting write)."""
+        db.create_session("s-live", source="cli", model="anthropic/claude-opus-4.6")
+
+        db.queue_token_counts(
+            "s-live", input_tokens=100, output_tokens=50, api_call_count=1,
+            model="anthropic/claude-opus-4.6", billing_provider="auto",
+        )
+        assert db.flush_token_counts()
+
+        totals = _totals(db, "s-live")
+        assert totals["input_tokens"] == 100
+        assert totals["output_tokens"] == 50
+        assert totals["api_call_count"] == 1
+        # Per-model attribution must still record the route.
+        usage = _model_usage(db, "s-live")
+        assert usage and usage[0]["model"] == "anthropic/claude-opus-4.6"
+        assert usage[0]["input_tokens"] == 100

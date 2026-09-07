@@ -274,11 +274,17 @@ class SessionSessionsMixin:
         chat_id: str = None, chat_type: str = None, thread_id: str = None,
         parent_session_id: str = None, cwd: str = None, profile_name: Optional[str] = None,
         git_repo_root: str = None, origin_json: str = None, display_name: str = None,
+        ensure_exists: bool = True,
     ) -> None:
         """Upsert a session row, never overwriting what an earlier writer set (the gateway creates a
         bare row before create_session carries the real model/prompt). chat_id/thread_id scope gateway
         /resume (IDOR). Children backfill from the parent; a missing profile_name is stamped with THIS
         store's own (NULL reads as unowned).
+
+        ``ensure_exists=False`` is the fail-closed sibling used by per-turn writers that need to
+        backfill model/billing columns on the active session, but MUST NOT resurrect a session row the
+        user just deleted — a stale token delta landing after ``delete_session()`` would otherwise mint a
+        phantom ``source='unknown'`` row with no transcript and no chat context.
 
         When ``parent_session_id`` is set (compression fork, delegate/subagent spawn, branch continuation)
         and this row's own ``cwd``/``git_repo_root``/ ``git_branch``/``profile_name`` are still NULL after
@@ -304,6 +310,11 @@ class SessionSessionsMixin:
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
         def _do(conn):
+            if not ensure_exists and conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+                # Row was deleted (or never created — caller's choice). A stale per-turn writer must
+                # not resurrect the row as a phantom source='unknown' record.
+                return
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
