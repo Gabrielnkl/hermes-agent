@@ -420,3 +420,55 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
 
 
+@pytest.fixture
+def fs_routes_client():
+    client, prev_auth_required, prev_bound_host = _client_with_app_state()
+    try:
+        yield client
+    finally:
+        _close_client(client)
+        _restore_app_state(prev_auth_required, prev_bound_host)
+
+
+def test_fs_read_text_refuses_credential_files(fs_routes_client, tmp_path):
+    """/api/fs/read-text must enforce the same sensitive-path guard as its
+    sibling read endpoints (/api/fs/read-data-url, /api/fs/download) and the
+    managed-files API — credential content must 403, ordinary files stay readable."""
+    client = fs_routes_client
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("SECRET_KEY=abc123")
+    assert client.get("/api/fs/read-text", params={"path": str(env_file)}).status_code == 403
+
+    mcp_dir = tmp_path / "mcp-tokens"
+    mcp_dir.mkdir()
+    token_file = mcp_dir / "github.json"
+    token_file.write_text('{"access_token": "SECRET"}\n')
+    assert client.get("/api/fs/read-text", params={"path": str(token_file)}).status_code == 403
+
+    ordinary = tmp_path / "notes.md"
+    ordinary.write_text("hello")
+    response = client.get("/api/fs/read-text", params={"path": str(ordinary)})
+    assert response.status_code == 200
+    assert response.json()["text"] == "hello"
+
+
+def test_fs_list_hides_credential_files(fs_routes_client, tmp_path):
+    """/api/fs/list must not expose credential filenames — mirrors the
+    managed-files listing filter."""
+    client = fs_routes_client
+
+    ordinary = tmp_path / "notes.md"
+    ordinary.write_text("hello")
+    (tmp_path / ".env").write_text("SECRET_KEY=abc123")
+    mcp_dir = tmp_path / "mcp-tokens"
+    mcp_dir.mkdir()
+    (mcp_dir / "github.json").write_text('{"access_token": "SECRET"}\n')
+
+    names = [e["name"] for e in client.get(
+        "/api/fs/list", params={"path": str(tmp_path)}).json()["entries"]]
+    assert "notes.md" in names
+    assert ".env" not in names
+    assert "mcp-tokens" not in names
+
+
