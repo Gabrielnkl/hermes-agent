@@ -1117,6 +1117,52 @@ def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
         logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
 
 
+def _dead_target_registry():
+    """Profile-local persistent DeadTargetRegistry shared with the gateway delivery path.
+
+    Independently constructed registries share state through the same backing file
+    (``<HERMES_HOME>/gateway/dead_targets.json``), so the cron live lane observes marks made
+    by ``DeliveryRouter.deliver()`` and vice versa — no singleton required."""
+    from gateway.dead_targets import DeadTargetRegistry
+    return DeadTargetRegistry()
+
+
+def _dead_target_identity(t: _TargetDelivery) -> tuple[str, str]:
+    """``(platform, chat_id)`` key for dead-target tracking: the LOGICAL platform, never the
+    relay transport identity — a dead ``telegram:<chat>`` reached via relay is still
+    ``telegram:<chat>`` (the same key ``DeliveryRouter.deliver()`` uses)."""
+    platform = getattr(t.platform, "value", None) or str(t.platform_name or "")
+    return str(platform).strip().lower(), str(t.chat_id)
+
+
+def _mark_dead_target(registry, platform: str, chat_id: str, error_text: str) -> Optional[str]:
+    """Record a whole-chat permanent failure; return the dead error_kind, else None.
+
+    Single classification boundary for the cron live lane — reuses ``classify_dead_error`` so
+    transient/rate-limit errors and thread/topic-level ``not_found`` never poison the chat
+    (same contract as ``deliver()``)."""
+    from gateway.dead_targets import classify_dead_error
+    dead_kind = classify_dead_error(error_text)
+    if dead_kind:
+        registry.mark_dead(platform, chat_id, reason=f"{dead_kind}: {str(error_text)[:120]}")
+    return dead_kind
+
+
+def _suppress_standalone_for_dead_target(
+    t: _TargetDelivery, target_errors: list, delivery_errors: list,
+) -> bool:
+    """True when ``t`` is confirmed-dead: a standalone retry would hit the same unreachable chat
+    with the same credential, so fail closed (record the live-lane errors) instead of
+    re-sending. Fresh registry read, so a mark flushed by the just-failed live lane applies."""
+    if not _dead_target_registry().is_dead(*_dead_target_identity(t)):
+        return False
+    if not target_errors:
+        target_errors.append(
+            f"delivery to {t.where} skipped (target previously confirmed unreachable)")
+    delivery_errors.extend(target_errors)
+    return True
+
+
 def _resolve_target_transport(
     job: dict, platform, platform_name: str, target: dict, adapters, config):
     """Resolve ``(transport, pconfig, runtime_adapter, target_adapters)`` for one target, or
@@ -1373,6 +1419,17 @@ def _deliver_via_live_adapter(
     this lane's soft failures (surfaced only if standalone also fails); ``delivery_errors`` =
     partial failures (media, thread fallback) that surface even on success."""
     job = t.job
+    dead_registry = _dead_target_registry()
+    dead_platform, dead_chat_id = _dead_target_identity(t)
+    if dead_registry.is_dead(dead_platform, dead_chat_id):
+        # Confirmed-dead (deleted group, blocked bot, deactivated user): re-sending every tick
+        # burns flood-control budget — skip the live lane; _deliver_result also skips the
+        # standalone fallback for the same reason.
+        msg = (f"live adapter send to {t.where} skipped "
+               f"(target previously confirmed unreachable)")
+        logger.info("Job '%s': %s", job["id"], msg)
+        target_errors.append(msg)
+        return False
     route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
     delivered = False
     try:
@@ -1421,12 +1478,24 @@ def _deliver_via_live_adapter(
                 route_thread_id if route_thread_id is not None else "-",
                 delivered_message_id if delivered_message_id is not None else "-")
             delivered = True
+            # Self-healing (same contract as deliver()): a send that goes through clears a stale
+            # dead flag — e.g. the bot was re-added after another instance marked the target.
+            dead_registry.clear(dead_platform, dead_chat_id)
             _seed_live_delivery_sessions(t, delivered_message_id)
     except Exception as e:
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
         if not any(err_msg in err for err in target_errors):
             target_errors.append(err_msg)
-        _warn_live_lane_failure(job, err_msg, t.is_relay)
+        dead_kind = _mark_dead_target(dead_registry, dead_platform, dead_chat_id, str(e))
+        if dead_kind is not None:
+            # Permanent whole-chat failure: the standalone lane would hit the same unreachable
+            # chat — say so instead of promising a fallback that _deliver_result will skip.
+            logger.warning(
+                "Job '%s': %s — target confirmed unreachable (%s), "
+                "skipping standalone fallback",
+                job["id"], err_msg, dead_kind)
+        else:
+            _warn_live_lane_failure(job, err_msg, t.is_relay)
     return delivered
 
 
@@ -1766,7 +1835,9 @@ def _deliver_result(
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
-        if not delivered:
+        if not delivered and not _suppress_standalone_for_dead_target(
+            t, target_errors, delivery_errors,
+        ):
             _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
 
